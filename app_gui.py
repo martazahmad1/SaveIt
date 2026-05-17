@@ -27,7 +27,7 @@ class SaveItApp:
         self.root.minsize(800, 500)
         self.root.configure(bg=COLORS['bg_dark'])
 
-        self.selected_file = None
+        self.selected_files = []
         self.last_output_path = None
         self._orig_pil = None
         self._res_pil = None
@@ -177,7 +177,7 @@ class SaveItApp:
         if not path:
             return
         self.selected_file = path
-        self.lbl_file.config(text=os.path.basename(path))
+        self.lbl_file.config(text=f'{len(self.selected_files)} files selected')
         ext = os.path.splitext(path)[1].lower()
 
         if ext == '.saveit':
@@ -217,7 +217,7 @@ class SaveItApp:
                 pass
 
     def _reset(self):
-        self.selected_file = None
+        self.selected_files = []
         self.last_output_path = None
         self._orig_pil = None
         self._res_pil = None
@@ -243,8 +243,8 @@ class SaveItApp:
 
     # ── run ──
     def _run(self):
-        if not self.selected_file:
-            messagebox.showwarning("No File", "Select a file first.")
+        if not getattr(self, 'selected_files', []):
+            messagebox.showwarning("No Files", "Select files first.")
             return
         self.log_text.delete("1.0", tk.END)
         self.btn_run.config(state=tk.DISABLED, text="Processing...")
@@ -265,84 +265,63 @@ class SaveItApp:
             self.root.after(0, lambda: self.btn_run.config(state=tk.NORMAL, text="RUN"))
 
     def _do_compress(self):
-        d = os.path.dirname(self.selected_file)
-        out = os.path.join(d, "compressed.saveit")
-
         comp_type = self.compress_type_var.get()
+        total_saved_kb = 0
+        total_orig_kb = 0
         
-        if comp_type == "lossless":
-            self._log("LOSSLESS COMPRESSION")
-            self._log("=" * 40)
-            self._log("Your image will be compressed without losing any quality.")
-            self._log("Decompression restores exact original pixels.\n")
+        self._log(f"BATCH COMPRESSION ({comp_type.upper()})")
+        self._log("=" * 40)
 
-            result = lossless_compress(self.selected_file, output_saveit_path=out, callback=self._log)
-        else:
-            self._log("AI NEURAL COMPRESSION")
-            self._log("=" * 40)
-            self._log("Using pre-trained Convolutional Autoencoder.")
-            self._log("Fast inference and massive file size reduction.\n")
+        for i, fpath in enumerate(self.selected_files):
+            d = os.path.dirname(fpath)
+            out = os.path.splitext(fpath)[0] + ".saveit"
+            
+            self._log(f"[{i+1}/{len(self.selected_files)}] Compressing {os.path.basename(fpath)}...")
+            
+            orig_size = os.path.getsize(fpath)
+            total_orig_kb += orig_size / 1024
+            
+            if comp_type == "lossless":
+                result = lossless_compress(fpath, output_saveit_path=out, callback=self._log)
+            else:
+                result = compress_image(fpath, output_saveit_path=out, callback=self._log)
+                
+            comp_size = os.path.getsize(result)
+            total_saved_kb += comp_size / 1024
+            self.last_output_path = result
 
-            result = compress_image(self.selected_file, output_saveit_path=out, callback=self._log)
+            # Show preview for last image
+            if i == len(self.selected_files) - 1:
+                try:
+                    img = Image.open(fpath)
+                    self._orig_pil = img
+                    self._res_pil = img
+                    self.root.after(0, lambda: self._draw(self.canvas_result, self._orig_pil))
+                except: pass
 
-        self.last_output_path = result
         self.root.after(0, lambda: self.btn_save.config(state=tk.NORMAL))
-
-        # Show original image on result side too
-        if self._orig_pil:
-            self._res_pil = self._orig_pil
-            self.root.after(0, lambda: self._draw(self.canvas_result, self._orig_pil))
-
-        # Calculate stats
-        orig_file = os.path.getsize(self.selected_file)
-        comp_file = os.path.getsize(result)
-        img = Image.open(self.selected_file)
-        w, h = img.size
-        raw_size = w * h * 3  # Raw pixel size
-
-        saved_pct = (1 - comp_file / raw_size) * 100
-        mode_str = "LOSSLESS" if comp_type == "lossless" else "AI NEURAL"
-        self._set_info(
-            f"Raw: {raw_size/1024:.0f} KB  |  "
-            f"Compressed: {comp_file/1024:.0f} KB  |  "
-            f"{saved_pct:.0f}% reduced  |  {mode_str}"
-        )
-        self._log(f"\nDone! Use 'Save Output As...' to save the .saveit file.")
+        self._set_info(f"Batch Complete | Orig: {total_orig_kb:.0f} KB | Comp: {total_saved_kb:.0f} KB")
+        self._log(f"\nBatch complete! Saved directly to the same folders.")
 
     def _do_decompress(self):
-        d = os.path.dirname(self.selected_file)
-        comp_kb = os.path.getsize(self.selected_file) / 1024
-
-        self._log("LOSSLESS DECOMPRESSION")
+        self._log("BATCH DECOMPRESSION")
         self._log("=" * 40)
-        self._log("Restoring original image quality...\n")
 
-        # Auto-detect version
-        try:
-            version = detect_saveit_version(self.selected_file)
-            if version == 2:
-                self._log("Format: Lossless v2 -- pixel-perfect recovery\n")
-                out = os.path.join(d, "restored.png")
-            else:
-                self._log("Format: Autoencoder v1 -- neural reconstruction\n")
-                out = os.path.join(d, "restored.jpg")
-            result = smart_decompress(self.selected_file, output_path=out,
-                                       callback=self._log)
-        except Exception as e:
-            self._log(f"Error: {e}")
-            return
+        for i, fpath in enumerate(self.selected_files):
+            self._log(f"[{i+1}/{len(self.selected_files)}] Decompressing {os.path.basename(fpath)}...")
+            try:
+                # Let smart_decompress auto-determine the path and original extension
+                result = smart_decompress(fpath, output_path=None, callback=self._log)
+                self.last_output_path = result
+                
+                if i == len(self.selected_files) - 1:
+                    self._show_result(result)
+            except Exception as e:
+                self._log(f"Error on {os.path.basename(fpath)}: {e}")
 
-        self.last_output_path = result
         self.root.after(0, lambda: self.btn_save.config(state=tk.NORMAL))
-        self._show_result(result)
-
-        rest_kb = os.path.getsize(result) / 1024
-        self._set_info(
-            f"Compressed: {comp_kb:.0f} KB  |  "
-            f"Restored: {rest_kb:.0f} KB  |  "
-            f"Original quality recovered"
-        )
-        self._log(f"\nDone! Use 'Save Output As...' to save the restored image.")
+        self._set_info(f"Batch Decompression Complete")
+        self._log(f"\nBatch complete! Files restored to their original formats in the same folders.")
 
     def _show_result(self, path):
         try:

@@ -78,7 +78,7 @@ def quick_compress(image_path, output_path=None, quality=80, resize_dim=None,
 #    Produces TINY .saveit files that can be fully recovered.
 # ============================================================
 
-def compress_image(image_path, output_saveit_path="compressed.saveit", resize_dim=None, callback=None):
+def compress_image(image_path, output_saveit_path=None, resize_dim=None, callback=None):
     """
     CNN AUTOENCODER COMPRESSION (Inference Only)
     1. Load pre-trained ConvAutoencoder
@@ -87,7 +87,7 @@ def compress_image(image_path, output_saveit_path="compressed.saveit", resize_di
     4. Compress with zlib and save to .saveit
     """
     log = lambda m: safe_log(m, callback)
-    log(f"Compressing with pre-trained CNN: {image_path}")
+    log(f"Compressing with pre-trained CNN: {os.path.basename(image_path)}")
     
     image = cv2.imread(image_path)
     if image is None:
@@ -95,7 +95,9 @@ def compress_image(image_path, output_saveit_path="compressed.saveit", resize_di
 
     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     orig_h, orig_w = image.shape[:2]
-    log(f"Original: {orig_w}x{orig_h}")
+    
+    orig_filename = os.path.basename(image_path)
+    filename_bytes = orig_filename.encode('utf-8')
 
     if resize_dim and resize_dim[0] > 0 and resize_dim[1] > 0:
         image = cv2.resize(image, (resize_dim[0], resize_dim[1]), interpolation=cv2.INTER_AREA)
@@ -111,10 +113,8 @@ def compress_image(image_path, output_saveit_path="compressed.saveit", resize_di
     new_h, new_w = image.shape[:2]
     image_normalized = image.astype('float32') / 255.0
     
-    # Convert to PyTorch tensor (1, C, H, W)
     tensor_img = torch.tensor(image_normalized).permute(2, 0, 1).unsqueeze(0).contiguous()
     
-    # Load model and run inference
     model_path = "saved_models/cnn_autoencoder.pth"
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model not found at {model_path}. Please run train.py first.")
@@ -136,18 +136,21 @@ def compress_image(image_path, output_saveit_path="compressed.saveit", resize_di
     # Quantize latent vectors
     lat_q, lat_min, lat_max = quantize(latent_np)
     
-    # Prepare metadata: new_h, new_w, orig_h, orig_w, channels
     metadata = np.array([new_h, new_w, orig_h, orig_w, c], dtype=np.int32)
     quant_params = np.array([lat_min, lat_max], dtype=np.float32)
     shape_data = np.array(lat_q.shape, dtype=np.int32)
     
     compressed_bytes = zlib.compress(lat_q.tobytes(), level=9)
     
-    if not output_saveit_path.endswith('.saveit'):
+    if output_saveit_path is None:
+        output_saveit_path = os.path.splitext(image_path)[0] + ".saveit"
+    elif not output_saveit_path.endswith('.saveit'):
         output_saveit_path += '.saveit'
         
     with open(output_saveit_path, 'wb') as f:
-        f.write(b'SAVEIT01')
+        f.write(b'SAVEIT03')
+        f.write(struct.pack('I', len(filename_bytes)))
+        f.write(filename_bytes)
         f.write(metadata.tobytes())
         f.write(quant_params.tobytes())
         f.write(struct.pack('I', len(shape_data)))
@@ -159,23 +162,27 @@ def compress_image(image_path, output_saveit_path="compressed.saveit", resize_di
     comp_size = os.path.getsize(output_saveit_path)
     ratio = orig_size / max(comp_size, 1)
     log(f"Original: {orig_size/1024:.0f} KB, Compressed: {comp_size/1024:.0f} KB")
-    log(f"Compression ratio: {ratio:.1f}x smaller")
     return output_saveit_path
 
 # ============================================================
 # 3. AUTOENCODER DECOMPRESS - Recover image from .saveit
 # ============================================================
 
-def decompress_image(saveit_path, output_rec_path="restored.jpg", callback=None):
+def decompress_image(saveit_path, output_rec_path=None, callback=None):
     """
     CNN AUTOENCODER DECOMPRESSION
     """
     log = lambda m: safe_log(m, callback)
-    log(f"Decompressing: {saveit_path}")
+    log(f"Decompressing: {os.path.basename(saveit_path)}")
 
     with open(saveit_path, 'rb') as f:
         magic = f.read(8)
-        if magic != b'SAVEIT01':
+        if magic == b'SAVEIT03':
+            fname_len = struct.unpack('I', f.read(4))[0]
+            orig_filename = f.read(fname_len).decode('utf-8')
+        elif magic == b'SAVEIT01':
+            orig_filename = "restored.jpg"
+        else:
             raise ValueError("Not a valid .saveit file")
 
         metadata = np.frombuffer(f.read(5 * 4), dtype=np.int32)
@@ -215,8 +222,12 @@ def decompress_image(saveit_path, output_rec_path="restored.jpg", callback=None)
     rec_image = rec_image[:orig_h, :orig_w, :]
     
     rec_bgr = cv2.cvtColor(rec_image, cv2.COLOR_RGB2BGR)
+
+    if output_rec_path is None:
+        base_dir = os.path.dirname(saveit_path)
+        output_rec_path = os.path.join(base_dir, orig_filename)
+        
     cv2.imwrite(output_rec_path, rec_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
-    log(f"Restored to {output_rec_path}")
     return output_rec_path
 
 # ============================================================
@@ -414,12 +425,12 @@ def lossless_decompress(saveit_path, output_path=None, callback=None):
 
 
 def detect_saveit_version(saveit_path):
-    """Detect whether a .saveit file is v1 (autoencoder) or v2 (lossless)."""
+    """Detect whether a .saveit file is v1/v3 (autoencoder) or v2 (lossless)."""
     with open(saveit_path, 'rb') as f:
         magic = f.read(8)
     if magic == b'SAVEIT02':
         return 2
-    elif magic == b'SAVEIT01':
+    elif magic == b'SAVEIT01' or magic == b'SAVEIT03':
         return 1
     else:
         raise ValueError(f"Unknown .saveit format: {magic}")
@@ -434,8 +445,7 @@ def smart_decompress(saveit_path, output_path=None, callback=None):
     if version == 2:
         return lossless_decompress(saveit_path, output_path=output_path, callback=callback)
     else:
-        out = output_path or "restored.jpg"
-        return decompress_image(saveit_path, output_rec_path=out, callback=callback)
+        return decompress_image(saveit_path, output_rec_path=output_path, callback=callback)
 
 
 if __name__ == "__main__":
