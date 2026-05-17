@@ -8,7 +8,7 @@ from PIL import Image, ImageTk
 import threading
 import os
 
-from image_compressor import (lossless_compress, lossless_decompress,
+from image_compressor import (compress_image, lossless_compress, lossless_decompress,
                               smart_decompress, detect_saveit_version)
 
 COLORS = {
@@ -34,6 +34,7 @@ class SaveItApp:
 
         # Mode: compress or decompress
         self.mode_var = tk.StringVar(value="compress")
+        self.compress_type_var = tk.StringVar(value="ai")
 
         self._build_ui()
         self.root.bind("<Configure>", self._on_resize)
@@ -267,17 +268,27 @@ class SaveItApp:
         d = os.path.dirname(self.selected_file)
         out = os.path.join(d, "compressed.saveit")
 
-        self._log("LOSSLESS COMPRESSION")
-        self._log("=" * 40)
-        self._log("Your image will be compressed without losing any quality.")
-        self._log("Decompression restores exact original pixels.\n")
+        comp_type = self.compress_type_var.get()
+        
+        if comp_type == "lossless":
+            self._log("LOSSLESS COMPRESSION")
+            self._log("=" * 40)
+            self._log("Your image will be compressed without losing any quality.")
+            self._log("Decompression restores exact original pixels.\n")
 
-        result = lossless_compress(self.selected_file, output_saveit_path=out,
-                                   callback=self._log)
+            result = lossless_compress(self.selected_file, output_saveit_path=out, callback=self._log)
+        else:
+            self._log("AI NEURAL COMPRESSION")
+            self._log("=" * 40)
+            self._log("Using pre-trained Convolutional Autoencoder.")
+            self._log("Fast inference and massive file size reduction.\n")
+
+            result = compress_image(self.selected_file, output_saveit_path=out, callback=self._log)
+
         self.last_output_path = result
         self.root.after(0, lambda: self.btn_save.config(state=tk.NORMAL))
 
-        # Show original image on result side too (lossless = identical)
+        # Show original image on result side too
         if self._orig_pil:
             self._res_pil = self._orig_pil
             self.root.after(0, lambda: self._draw(self.canvas_result, self._orig_pil))
@@ -290,10 +301,11 @@ class SaveItApp:
         raw_size = w * h * 3  # Raw pixel size
 
         saved_pct = (1 - comp_file / raw_size) * 100
+        mode_str = "LOSSLESS" if comp_type == "lossless" else "AI NEURAL"
         self._set_info(
             f"Raw: {raw_size/1024:.0f} KB  |  "
             f"Compressed: {comp_file/1024:.0f} KB  |  "
-            f"{saved_pct:.0f}% reduced  |  LOSSLESS"
+            f"{saved_pct:.0f}% reduced  |  {mode_str}"
         )
         self._log(f"\nDone! Use 'Save Output As...' to save the .saveit file.")
 

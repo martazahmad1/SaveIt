@@ -1,4 +1,6 @@
 Flask==3.0.3
 Werkzeug==3.0.3
-numpy==1.26.4
-opencv-python-headless==4.9.0.80
+numpy
+opencv-python-headless
+torch
+torchvision

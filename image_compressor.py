@@ -5,50 +5,8 @@ import time
 import zlib
 import lzma
 import struct
-from network import Autoencoder, Dense, Activation, relu, relu_prime, sigmoid, sigmoid_prime
-
-# ============================================================
-# UTILITY FUNCTIONS
-# ============================================================
-
-def image_to_patches(image, patch_size):
-    """Splits an image into smaller squares (patches) for training."""
-    h, w, c = image.shape
-    patches = []
-    for i in range(0, h, patch_size):
-        for j in range(0, w, patch_size):
-            patch = image[i:i+patch_size, j:j+patch_size]
-            if patch.shape[0] == patch_size and patch.shape[1] == patch_size:
-                patches.append(patch)
-    return np.array(patches)
-
-def patches_to_image(patches, image_shape, patch_size):
-    """Reassembles an array of patches back into the full image."""
-    h, w, c = image_shape
-    image = np.zeros(image_shape)
-    idx = 0
-    for i in range(0, h - h % patch_size, patch_size):
-        for j in range(0, w - w % patch_size, patch_size):
-            image[i:i+patch_size, j:j+patch_size] = patches[idx]
-            idx += 1
-    return image
-
-def build_autoencoder(input_dim, encoding_dim):
-    """
-    Architecture:
-      Encoder: input_dim -> 256 -> encoding_dim  (layers 0-3)
-      Decoder: encoding_dim -> 256 -> input_dim   (layers 4-7)
-    """
-    ae = Autoencoder()
-    ae.add(Dense(input_dim, 256))
-    ae.add(Activation(relu, relu_prime))
-    ae.add(Dense(256, encoding_dim))
-    ae.add(Activation(relu, relu_prime))
-    ae.add(Dense(encoding_dim, 256))
-    ae.add(Activation(relu, relu_prime))
-    ae.add(Dense(256, input_dim))
-    ae.add(Activation(sigmoid, sigmoid_prime))
-    return ae
+import torch
+from cnn_network import ConvAutoencoder
 
 def safe_log(msg, callback=None):
     try: print(msg)
@@ -120,30 +78,17 @@ def quick_compress(image_path, output_path=None, quality=80, resize_dim=None,
 #    Produces TINY .saveit files that can be fully recovered.
 # ============================================================
 
-def compress_image(image_path, patch_size=8, encoding_dim=32, epochs=30,
-                   learning_rate=0.01, output_saveit_path="compressed.saveit",
-                   resize_dim=None, callback=None):
+def compress_image(image_path, output_saveit_path="compressed.saveit", resize_dim=None, callback=None):
     """
-    AUTOENCODER + QUANTIZATION COMPRESSION
-    
-    Pipeline:
-    1. Split image into patches
-    2. Train autoencoder to learn compression
-    3. Extract latent vectors from encoder (dimensionality reduction)
-    4. QUANTIZE latent vectors: float32 -> uint8 (4x smaller)
-    5. QUANTIZE decoder weights: float32 -> uint8
-    6. Compress everything with zlib (lossless)
-    7. Save as tiny .saveit binary file
-    
-    The combination of:
-    - Bottleneck (192 dims -> 32 dims = 6x reduction)
-    - Quantization (float32 -> uint8 = 4x reduction)  
-    - Zlib compression (patterns in uint8 compress well = ~2-3x more)
-    gives total ~50-70x compression from raw pixel data.
+    CNN AUTOENCODER COMPRESSION (Inference Only)
+    1. Load pre-trained ConvAutoencoder
+    2. Pass image through encoder -> latent tensor
+    3. Quantize latent tensor to uint8
+    4. Compress with zlib and save to .saveit
     """
     log = lambda m: safe_log(m, callback)
-
-    log(f"Compressing: {image_path}")
+    log(f"Compressing with pre-trained CNN: {image_path}")
+    
     image = cv2.imread(image_path)
     if image is None:
         raise ValueError(f"Could not load image: {image_path}")
@@ -156,79 +101,64 @@ def compress_image(image_path, patch_size=8, encoding_dim=32, epochs=30,
         image = cv2.resize(image, (resize_dim[0], resize_dim[1]), interpolation=cv2.INTER_AREA)
         log(f"Resized to: {image.shape[1]}x{image.shape[0]}")
 
+    # Pad image dimensions to be multiples of 4 (required by 2 stride=2 layers in CNN)
+    h, w, c = image.shape
+    pad_h = (4 - (h % 4)) % 4
+    pad_w = (4 - (w % 4)) % 4
+    if pad_h > 0 or pad_w > 0:
+        image = cv2.copyMakeBorder(image, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=0)
+    
+    new_h, new_w = image.shape[:2]
     image_normalized = image.astype('float32') / 255.0
-    h, w, c = image_normalized.shape
-    h_adj = h - (h % patch_size)
-    w_adj = w - (w % patch_size)
-    image_adj = image_normalized[:h_adj, :w_adj, :]
-
-    patches = image_to_patches(image_adj, patch_size)
-    n_patches = patches.shape[0]
-    input_dim = patch_size * patch_size * c
-    x_train = patches.reshape((n_patches, input_dim))
-
-    log(f"Patches: {n_patches}, Input: {input_dim}, Bottleneck: {encoding_dim}")
-    log(f"Dimensionality reduction: {input_dim} -> {encoding_dim} ({input_dim/encoding_dim:.1f}x)")
-
-    ae = build_autoencoder(input_dim, encoding_dim)
-    log("Training Autoencoder...")
-    start = time.time()
-    ae.fit(x_train, epochs=epochs, learning_rate=learning_rate, batch_size=64, callback=callback)
-    log(f"Training done in {time.time() - start:.1f}s")
-
-    # Extract latent vectors through encoder (layers 0-3)
-    latent = x_train.copy()
-    for layer in ae.layers[:4]:
-        latent = layer.forward(latent)
-
-    # QUANTIZE latent vectors and decoder weights to uint8
-    lat_q, lat_min, lat_max = quantize(latent)
-    dw1_q, dw1_min, dw1_max = quantize(ae.layers[4].weights)
-    db1_q, db1_min, db1_max = quantize(ae.layers[4].bias)
-    dw2_q, dw2_min, dw2_max = quantize(ae.layers[6].weights)
-    db2_q, db2_min, db2_max = quantize(ae.layers[6].bias)
-
-    log("Quantized latent + weights to uint8")
-
-    # Pack everything into a single binary blob
-    # Format: metadata (ints) + quantization params (floats) + zlib(uint8 data)
-    metadata = np.array([patch_size, encoding_dim, input_dim, h_adj, w_adj, c,
-                         n_patches], dtype=np.int32)
-    quant_params = np.array([lat_min, lat_max, dw1_min, dw1_max, db1_min, db1_max,
-                             dw2_min, dw2_max, db2_min, db2_max], dtype=np.float32)
-
-    # Concatenate all uint8 arrays and compress with zlib level 9
-    all_uint8 = np.concatenate([lat_q.flatten(), dw1_q.flatten(), db1_q.flatten(),
-                                dw2_q.flatten(), db2_q.flatten()])
-    compressed_bytes = zlib.compress(all_uint8.tobytes(), level=9)
-
-    # Save sizes for splitting on decompress
-    sizes = np.array([lat_q.size, dw1_q.size, db1_q.size, dw2_q.size, db2_q.size],
-                     dtype=np.int32)
-    shapes = np.array([*lat_q.shape, *dw1_q.shape, *db1_q.shape, *dw2_q.shape, *db2_q.shape],
-                      dtype=np.int32)
-
-    # Write custom binary file
+    
+    # Convert to PyTorch tensor (1, C, H, W)
+    tensor_img = torch.tensor(image_normalized).permute(2, 0, 1).unsqueeze(0).contiguous()
+    
+    # Load model and run inference
+    model_path = "saved_models/cnn_autoencoder.pth"
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model not found at {model_path}. Please run train.py first.")
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = ConvAutoencoder().to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+    
+    tensor_img = tensor_img.to(device)
+    
+    start_time = time.time()
+    with torch.no_grad():
+        latent_tensor = model.encoder(tensor_img)
+    log(f"Inference complete in {time.time() - start_time:.3f}s")
+    
+    latent_np = latent_tensor.cpu().numpy()
+    
+    # Quantize latent vectors
+    lat_q, lat_min, lat_max = quantize(latent_np)
+    
+    # Prepare metadata: new_h, new_w, orig_h, orig_w, channels
+    metadata = np.array([new_h, new_w, orig_h, orig_w, c], dtype=np.int32)
+    quant_params = np.array([lat_min, lat_max], dtype=np.float32)
+    shape_data = np.array(lat_q.shape, dtype=np.int32)
+    
+    compressed_bytes = zlib.compress(lat_q.tobytes(), level=9)
+    
     if not output_saveit_path.endswith('.saveit'):
         output_saveit_path += '.saveit'
-
+        
     with open(output_saveit_path, 'wb') as f:
-        # Header: magic bytes
         f.write(b'SAVEIT01')
-        # Metadata
         f.write(metadata.tobytes())
         f.write(quant_params.tobytes())
-        f.write(sizes.tobytes())
-        f.write(shapes.tobytes())
-        # Compressed data length + data
+        f.write(struct.pack('I', len(shape_data)))
+        f.write(shape_data.tobytes())
         f.write(struct.pack('I', len(compressed_bytes)))
         f.write(compressed_bytes)
 
     orig_size = os.path.getsize(image_path)
     comp_size = os.path.getsize(output_saveit_path)
     ratio = orig_size / max(comp_size, 1)
-    log(f"Original: {orig_size/1024:.0f} KB")
-    log(f"Compressed: {comp_size/1024:.0f} KB")
+    log(f"Original: {orig_size/1024:.0f} KB, Compressed: {comp_size/1024:.0f} KB")
     log(f"Compression ratio: {ratio:.1f}x smaller")
     return output_saveit_path
 
@@ -238,93 +168,55 @@ def compress_image(image_path, patch_size=8, encoding_dim=32, epochs=30,
 
 def decompress_image(saveit_path, output_rec_path="restored.jpg", callback=None):
     """
-    DEQUANTIZE + DECODE to recover the image.
-    
-    Pipeline:
-    1. Read binary .saveit file
-    2. Decompress zlib data
-    3. Dequantize uint8 -> float32 (using stored min/max)
-    4. Rebuild decoder with dequantized weights
-    5. Pass dequantized latent vectors through decoder
-    6. Reconstruct image from patches
+    CNN AUTOENCODER DECOMPRESSION
     """
     log = lambda m: safe_log(m, callback)
     log(f"Decompressing: {saveit_path}")
-
-    if not os.path.exists(saveit_path):
-        raise FileNotFoundError(f"File not found: {saveit_path}")
 
     with open(saveit_path, 'rb') as f:
         magic = f.read(8)
         if magic != b'SAVEIT01':
             raise ValueError("Not a valid .saveit file")
 
-        metadata = np.frombuffer(f.read(7 * 4), dtype=np.int32)
-        quant_params = np.frombuffer(f.read(10 * 4), dtype=np.float32)
-        sizes = np.frombuffer(f.read(5 * 4), dtype=np.int32)
-        shapes = np.frombuffer(f.read(10 * 4), dtype=np.int32)  # 5 arrays x 2 dims
-
+        metadata = np.frombuffer(f.read(5 * 4), dtype=np.int32)
+        quant_params = np.frombuffer(f.read(2 * 4), dtype=np.float32)
+        
+        shape_len = struct.unpack('I', f.read(4))[0]
+        shape_data = np.frombuffer(f.read(shape_len * 4), dtype=np.int32)
+        
         comp_len = struct.unpack('I', f.read(4))[0]
         compressed_bytes = f.read(comp_len)
 
-    patch_size, encoding_dim, input_dim = int(metadata[0]), int(metadata[1]), int(metadata[2])
-    h_adj, w_adj, c, n_patches = int(metadata[3]), int(metadata[4]), int(metadata[5]), int(metadata[6])
-
-    lat_min, lat_max = quant_params[0], quant_params[1]
-    dw1_min, dw1_max = quant_params[2], quant_params[3]
-    db1_min, db1_max = quant_params[4], quant_params[5]
-    dw2_min, dw2_max = quant_params[6], quant_params[7]
-    db2_min, db2_max = quant_params[8], quant_params[9]
-
-    log(f"Restoring: {w_adj}x{h_adj}, bottleneck={encoding_dim}")
-
-    # Decompress and split
-    all_bytes = zlib.decompress(compressed_bytes)
-    all_uint8 = np.frombuffer(all_bytes, dtype=np.uint8)
-
-    # Split back into individual arrays
-    offsets = np.cumsum([0] + list(sizes))
-    lat_q = all_uint8[offsets[0]:offsets[1]].reshape(n_patches, encoding_dim)
+    new_h, new_w, orig_h, orig_w, c = metadata
+    lat_min, lat_max = quant_params
     
-    si = 2  # shapes index (skip lat_q's 2 shape values)
-    dw1_shape = (shapes[si], shapes[si+1]); si += 2
-    db1_shape = (shapes[si], shapes[si+1]); si += 2
-    dw2_shape = (shapes[si], shapes[si+1]); si += 2
-    db2_shape = (shapes[si], shapes[si+1])
-
-    dw1_q = all_uint8[offsets[1]:offsets[2]].reshape(dw1_shape)
-    db1_q = all_uint8[offsets[2]:offsets[3]].reshape(db1_shape)
-    dw2_q = all_uint8[offsets[3]:offsets[4]].reshape(dw2_shape)
-    db2_q = all_uint8[offsets[4]:offsets[5]].reshape(db2_shape)
-
-    # Dequantize everything back to float32
-    latent = dequantize(lat_q, lat_min, lat_max)
-    dw1 = dequantize(dw1_q, dw1_min, dw1_max)
-    db1 = dequantize(db1_q, db1_min, db1_max)
-    dw2 = dequantize(dw2_q, dw2_min, dw2_max)
-    db2 = dequantize(db2_q, db2_min, db2_max)
-
-    log("Dequantized latent + weights")
-
-    # Build decoder and inject weights
-    ae = build_autoencoder(input_dim, encoding_dim)
-    ae.layers[4].weights = dw1
-    ae.layers[4].bias = db1
-    ae.layers[6].weights = dw2
-    ae.layers[6].bias = db2
-
-    # Pass through decoder only (layers 4-7)
-    output = latent.copy()
-    for layer in ae.layers[4:]:
-        output = layer.forward(output)
-
-    rec_patches = output.reshape((n_patches, patch_size, patch_size, c))
-    rec_image = patches_to_image(rec_patches, (h_adj, w_adj, c), patch_size)
-    rec_image = np.clip(rec_image * 255, 0, 255).astype('uint8')
+    all_bytes = zlib.decompress(compressed_bytes)
+    lat_q = np.frombuffer(all_bytes, dtype=np.uint8).reshape(tuple(shape_data))
+    
+    latent_np = dequantize(lat_q, lat_min, lat_max)
+    
+    model_path = "saved_models/cnn_autoencoder.pth"
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = ConvAutoencoder().to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+    
+    latent_tensor = torch.tensor(latent_np).contiguous().to(device)
+    
+    start_time = time.time()
+    with torch.no_grad():
+        output_tensor = model.decoder(latent_tensor)
+    log(f"Inference complete in {time.time() - start_time:.3f}s")
+        
+    rec_image = output_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
+    rec_image = (rec_image * 255).clip(0, 255).astype(np.uint8)
+    
+    # Crop the padding
+    rec_image = rec_image[:orig_h, :orig_w, :]
+    
     rec_bgr = cv2.cvtColor(rec_image, cv2.COLOR_RGB2BGR)
-
     cv2.imwrite(output_rec_path, rec_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
-    log(f"Restored: {output_rec_path} ({os.path.getsize(output_rec_path)/1024:.0f} KB)")
+    log(f"Restored to {output_rec_path}")
     return output_rec_path
 
 # ============================================================

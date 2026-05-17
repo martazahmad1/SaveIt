@@ -44,8 +44,6 @@ def compress():
     if 'file' not in request.files:
         return jsonify({'error': 'No file uploaded'}), 400
     file = request.files['file']
-    epochs = int(request.form.get('epochs', 10))
-    encoding_dim = int(request.form.get('encoding_dim', 64))
     
     filename = secure_filename(file.filename)
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
@@ -54,8 +52,8 @@ def compress():
     output_path = os.path.join(app.config['UPLOAD_FOLDER'], 'compressed.saveit')
     
     try:
-        # Run compression
-        compress_image(filepath, epochs=epochs, encoding_dim=encoding_dim, output_saveit_path=output_path)
+        # Run compression (inference only using pre-trained PyTorch CNN model)
+        compress_image(filepath, output_saveit_path=output_path)
         return send_file(output_path, as_attachment=True, download_name='compressed.saveit')
     except Exception as e:
         return jsonify({'error': str(e)}), 500
